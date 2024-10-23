@@ -76,10 +76,8 @@ pub struct RecursiveCircuit<C: GKRConfig> {
 }
 
 impl<C: GKRConfig> RecursiveCircuit<C> {
-    pub fn load(filename: &str) -> std::result::Result<Self, CircuitError> {
-        let file_bytes = fs::read(filename)?;
-        let cursor = Cursor::new(file_bytes);
-
+    pub fn load_bytes(bytes: Vec<u8>) -> std::result::Result<Self, CircuitError> {
+        let cursor = Cursor::new(bytes);
         Ok(Self::deserialize_from(cursor))
     }
 
