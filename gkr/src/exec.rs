@@ -4,7 +4,7 @@ use std::{
     process::exit,
     sync::{Arc, Mutex},
 };
-
+use ethabi::ParamType;
 use arith::{Field, FieldSerde, FieldSerdeError};
 use circuit::Circuit;
 use config::{
@@ -51,6 +51,34 @@ fn detect_field_type_from_circuit_file(circuit_file: &str) -> FieldType {
             exit(1);
         }
     }
+}
+
+fn detect_field_type_from_bytes(field_bytes: &[u8]) -> FieldType {
+    match field_bytes.try_into().unwrap() {
+        SENTINEL_M31 => FieldType::M31,
+        SENTINEL_BN254 => FieldType::BN254,
+        SENTINEL_GF2 => FieldType::GF2,
+        _ => {
+            println!("Unknown field type. Field byte value: {:?}", field_bytes);
+            exit(1);
+        }
+    }
+}
+
+async fn run_verify<'a, C: GKRConfig>(
+    circuit_bytes: &[u8],
+    witness_bytes: &[u8],
+    proof_bytes: &[u8],
+    config: Config<C>,
+) {
+    let mut circuit = Circuit::<C>::load_circuit_bytes(circuit_bytes.to_vec()).expect("Unable to load Circuit");
+    circuit.load_witness_bytes(&witness_bytes, false);
+    let (proof, claimed_v) =
+        load_proof_and_claimed_v(&proof_bytes).expect("Unable to deserialize proof.");
+    let verifier = gkr::Verifier::new(&config);
+    let public_input = circuit.public_input.clone();
+    assert!(verifier.verify(&mut circuit, &public_input, &claimed_v, &proof));
+    println!("success");
 }
 
 async fn run_command<'a, C: GKRConfig>(
@@ -165,6 +193,100 @@ async fn run_command<'a, C: GKRConfig>(
     }
 }
 
+
+async fn verify(
+    data: Vec<u8>,
+    mpi_config: MPIConfig,
+) {
+
+    let tokens = ethabi::decode(
+        &[ParamType::Tuple(vec![
+            ParamType::Bytes,
+            ParamType::Bytes,
+            ParamType::Bytes,
+        ])],
+        &data,
+    ).expect("Unable to decode ethereum abi.");
+
+    let tuple = tokens
+        .first()
+        .cloned()
+        .and_then(|token| token.into_tuple())
+        .expect("Unable to decode tuple.");
+
+    let circuit_bytes = tuple
+        .first()
+        .cloned()
+        .and_then(|token| token.into_bytes())
+        .expect("Unable to decode circuit_bytes.");
+
+
+    let witness_bytes = tuple
+        .get(1)
+        .cloned()
+        .and_then(|token| token.into_bytes())
+        .expect("Unable to decode witness_bytes.");
+
+    let proof_bytes = tuple
+        .get(2)
+        .cloned()
+        .and_then(|token| token.into_bytes())
+        .expect("Unable to decode proof_bytes.");
+
+    let field_bytes = circuit_bytes[8..8 + 32].try_into().unwrap_or_default();
+    let field_type = detect_field_type_from_bytes(field_bytes);
+
+    match field_type {
+        FieldType::M31 => {
+            run_verify(
+                &circuit_bytes,
+                &witness_bytes,
+                &proof_bytes,
+                Config::<M31ExtConfigSha2>::new(GKRScheme::Vanilla, mpi_config.clone()),
+            ).await;
+        }
+        FieldType::BN254 => {
+            run_verify(
+                &circuit_bytes,
+                &witness_bytes,
+                &proof_bytes,
+                Config::<BN254ConfigSha2>::new(GKRScheme::Vanilla, mpi_config.clone()),
+            ).await;
+        }
+        FieldType::GF2 => {
+            run_verify(
+                &circuit_bytes,
+                &witness_bytes,
+                &proof_bytes,
+                Config::<GF2ExtConfigSha2>::new(GKRScheme::Vanilla, mpi_config.clone()),
+            ).await;
+        }
+    }
+}
+
+async fn verify_bytes(
+    args: &[String],
+    mpi_config: MPIConfig,
+) {
+
+    let data = &args[2];
+    let data_bytes = data.as_bytes();
+
+    verify(data_bytes.to_vec(), mpi_config).await;
+}
+
+async fn verify_scd(
+    args: &[String],
+    mpi_config: MPIConfig,
+) {
+
+    let data_file = &args[2];
+    let data_bytes = fs::read(data_file).expect("Unable to read proof from file.");
+
+    verify(data_bytes, mpi_config).await;
+
+}
+
 #[tokio::main]
 async fn main() {
     // examples:
@@ -174,6 +296,16 @@ async fn main() {
     let mpi_config = MPIConfig::new();
 
     let args = std::env::args().collect::<Vec<String>>();
+    if args[1] == "verify-scd" {
+        verify_scd(&args, mpi_config.clone()).await;
+        return;
+    }
+
+    if args[1] == "verify-bytes" {
+        verify_bytes(&args, mpi_config.clone()).await;
+        return;
+    }
+
     if args.len() < 4 {
         println!(
             "Usage: expander-exec prove <input:circuit_file> <input:witness_file> <output:proof>"
